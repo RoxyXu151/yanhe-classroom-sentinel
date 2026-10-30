@@ -1,6 +1,6 @@
 """Authorized VOD downloads with TLS verification, bounded retries and local-only remuxing."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
 import io
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import threading
+import time
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -41,6 +42,28 @@ class VODDownloader:
         self.client = client
         self.cancel = cancel or threading.Event()
         self.progress = progress or (lambda **kwargs: None)
+        self._diagnostics_path = None
+        self._diagnostics_lock = threading.RLock()
+
+    def _record_error(self, url, attempt, kind, status=None):
+        # Never serialize exception text, signed URLs, tokens, headers or local paths.
+        if self._diagnostics_path is None:
+            return
+        with self._diagnostics_lock:
+            path = self._diagnostics_path
+            try:
+                entries = json.loads(path.read_text('utf-8'))
+            except (OSError, ValueError):
+                entries = []
+            entries = entries[-99:] + [{'time': time.time(), 'resource': resource_key(url),
+                'attempt': attempt, 'kind': kind, 'http_status': status, 'route': 'direct'}]
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix('.pending')
+                temporary.write_text(json.dumps(entries, ensure_ascii=False, indent=2), 'utf-8')
+                temporary.replace(path)
+            except OSError:
+                pass  # Diagnostics must not discard an otherwise successful download.
 
     def check_canceled(self):
         if self.cancel.is_set():
@@ -57,7 +80,7 @@ class VODDownloader:
                 headers['Range'] = f'bytes={byte_range[0]}-{byte_range[1]}'
             try:
                 with httpx.Client(timeout=httpx.Timeout(30, connect=15), follow_redirects=False,
-                                  transport=self.client.media_transport()) as http:
+                                  transport=self.client.media_transport(), trust_env=False) as http:
                     with http.stream('GET', signed, headers=headers) as response:
                         if response.status_code in (401, 403):
                             raise PortalError('平台拒绝访问此录播，请在官网确认当前账户能正常播放；不会绕过权限。', 'permission', 403)
@@ -81,11 +104,18 @@ class VODDownloader:
                         if byte_range and total != byte_range[1] - byte_range[0] + 1:
                             raise httpx.ReadError('incomplete range')
                         return str(response.url)
-            except (PortalError, DownloadCanceled):
+            except PortalError as exc:
+                self._record_error(url, attempt + 1, exc.kind, exc.status)
                 raise
-            except (httpx.HTTPError, ValueError, OSError):
+            except DownloadCanceled:
+                raise
+            except (httpx.HTTPError, ValueError, OSError) as exc:
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                kind = type(exc).__name__
+                self._record_error(url, attempt + 1, kind, status)
                 if attempt == 2:
-                    raise PortalError('录播下载失败或分片不完整，成功分片已保留；请检查网络后重试。', 'download', 502) from None
+                    detail = f'HTTP {status}' if status is not None else kind
+                    raise PortalError(f'录播传输失败（{detail}，资源 {resource_key(url)[:12]}）；成功分片已保留，具体记录见 download-errors.json。', 'download', 502) from None
                 if self.cancel.wait(2 ** attempt):
                     raise DownloadCanceled()
 
@@ -113,18 +143,57 @@ class VODDownloader:
             'sha256': checksum(path)}), encoding='utf-8')
 
     def direct(self, url, destination):
+        self._diagnostics_path = destination.parent / 'download-errors.json'
         self.progress(stage='downloading', current=0, total=1, message='正在获取课堂音轨…')
         self._file(url, destination)
         self.progress(stage='downloading', current=1, total=1, message='课堂音轨已就绪')
         return destination
 
     def video(self, url, destination: Path):
+        self._diagnostics_path = destination.parent / 'download-errors.json'
         workers = max(1, min(8, int(os.environ.get('YANHE_SEGMENT_WORKERS', '4'))))
         executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='yanhe-segment')
         try:
             return self._video(url, destination, executor)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
+
+    def _segments(self, transfers, executor):
+        """Finish unaffected pieces, then retry only missing pieces sequentially."""
+        futures = {executor.submit(self._file, url, path, byte_range=byte_range): index
+                   for index, (url, path, byte_range) in enumerate(transfers)}
+        failed, completed = {}, 0
+        for future in as_completed(futures):
+            self.check_canceled()
+            try:
+                future.result()
+                completed += 1
+                self.progress(stage='downloading', current=completed, total=len(transfers),
+                    message=f'获取录播分片 {completed}/{len(transfers)}')
+            except PortalError as exc:
+                if exc.kind != 'download':
+                    raise
+                failed[futures[future]] = exc
+        for round_number in range(2):
+            if not failed:
+                return
+            if self.cancel.wait(2 ** round_number):
+                raise DownloadCanceled()
+            for index in list(failed):
+                self.check_canceled()
+                self.progress(stage='downloading', current=completed, total=len(transfers),
+                    message=f'自动补齐失败分片（第 {round_number + 1}/2 轮，剩余 {len(failed)} 个）')
+                url, path, byte_range = transfers[index]
+                try:
+                    self._file(url, path, byte_range=byte_range)
+                    del failed[index]
+                    completed += 1
+                except PortalError as exc:
+                    if exc.kind != 'download':
+                        raise
+                    failed[index] = exc
+        if failed:
+            raise PortalError(f'仍有 {len(failed)} 个分片未完成；{next(iter(failed.values()))}', 'download', 502)
 
     def _video(self, url, destination: Path, executor):
         if urlsplit(url).path.lower().endswith('.mp4'):
@@ -178,7 +247,8 @@ class VODDownloader:
                 start = int(offset) if offset else ranges.get(original, 0)
                 byte_range = (start, start + int(length) - 1)
                 ranges[original] = byte_range[1] + 1
-            transfers.append(executor.submit(self._file, original, work / f'segment-{index:06}.ts', byte_range=byte_range))
+            transfers.append((original, work / f'segment-{index:06}.ts', byte_range))
+        self._segments(transfers, executor)
         local_lines = ['#EXTM3U', '#EXT-X-VERSION:7',
             '#EXT-X-TARGETDURATION:' + str(max(1, math.ceil(max(s.duration for s in playlist.segments)))),
             '#EXT-X-MEDIA-SEQUENCE:' + str(int(playlist.media_sequence or 0))]
@@ -186,7 +256,6 @@ class VODDownloader:
         for index, segment in enumerate(playlist.segments):
             self.check_canceled()
             name = f'segment-{index:06}.ts'
-            transfers[index].result()
             if segment.discontinuity:
                 local_lines.append('#EXT-X-DISCONTINUITY')
             key = segment.key
@@ -216,8 +285,6 @@ class VODDownloader:
             if not math.isfinite(segment.duration) or segment.duration <= 0:
                 raise PortalError('录播分片时长格式无效。')
             local_lines.extend([f'#EXTINF:{segment.duration:.6f},', name])
-            self.progress(stage='downloading', current=index + 1, total=len(playlist.segments),
-                message=f'获取录播分片 {index + 1}/{len(playlist.segments)}')
         # Rebuild a minimal allowlisted playlist: no untrusted local paths or network URLs.
         local_lines.append('#EXT-X-ENDLIST')
         local_playlist = '\n'.join(local_lines) + '\n'
