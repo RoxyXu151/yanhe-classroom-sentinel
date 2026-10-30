@@ -6,6 +6,15 @@ Find attendance checks, homework, exams, grading rules and schedule changes in l
 
 This is a local web workspace, not an official university product. Model results require human review. A completed analysis or an empty result does not guarantee that nothing was missed.
 
+## Recent fixes
+
+- **Slow or failed campus media downloads**: media requests bypass system proxies while retaining TLS validation and platform authorization. Other software's proxy settings are unchanged.
+- **One failed segment aborting an entire recording**: finish unaffected segments first, then run up to two sequential recovery rounds for failed pieces. Resuming reuses validated cached segments.
+- **Unclear download errors**: expose error classes or HTTP status codes and keep up to 100 sanitized diagnostic entries, excluding playback URLs, tokens and raw exception messages. See [download recovery](docs/DOWNLOAD_RECOVERY.md).
+- **Duplicate course report entries**: group the dashboard, report list and study picker by official course ID, with one combined report per course.
+- **Failed retries displacing completed content**: prefer the latest completed result per recording while retaining original evidence and processing caches.
+- **Returning to the wrong course from reports or study**: preserve the actual course entry and return context across navigation and page reloads.
+
 ## One report per course
 
 Each official course has one stable report containing all its recordings. Retries reuse the latest completed result per recording and preserve existing complete content. Home, reports, and the study picker group entries by course. Export the combined report as Markdown; original evidence, subtitles, reviews, and caches remain available. Different official course IDs stay separate even when their titles match.
